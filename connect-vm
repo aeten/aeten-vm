@@ -1,0 +1,95 @@
+#!/bin/bash
+
+_VM_VERSION_=1.0
+
+# Uses a bridge connection like this:
+#auto br0
+#iface br0 inet static
+#        address 192.168.42.1
+#        network 192.168.42.0
+#        netmask 255.255.255.0
+#        broadcast 192.168.42.255
+#        gateway 192.168.42.1
+#        bridge_ports eth0
+#        bridge_stp off
+#        bridge_fd 0
+#        bridge_maxwait 0
+
+$($(dirname ${0})/aeten-cli/aeten-ads init --prefix VM_ - -- "${@}" << EOF
+#NAME: $(basename ${0})
+#TITLE: VM connection ($(basename ${0^^})) manual
+#VERSION: ${_VM_VERSION_}
+#SHORT_DESCRIPTION: Virtual machine quick connection tool.
+#DESCRIPTION: Launch (if necesary) and connect to a virtual machine.
+image <file>: The Qemu image to launch. This is required unless use of configuration file (see _--conf_ option).
+host-name|n <host-name>: This option may be used to specify the VM host name (or IP) to connect to. This is required unless use of configuration file (see _--conf_ option).
+user <user>: The user to use for the connection on the VM. Default is _root_.
+memory <memory>: The reserved memory (in MB). Default is _2048_MB (2GB).
+cpu <n>: The reserved number of CPU core. Default is _1_.
+arch <arch>: The VM architecture. The default is the same as host.
+timeout <s>: The connection timeout in seconds. Default is _60_.
+share <mapping>: A set of couples of directory:mount-point to share. Example: */path/to/share/1:/mount/point/1\ /path/to/share/2:/mount/point/2*.
+shut-down|d: Shut down the VM on exit.
+conf <file>: The configuration file to use.
+version: Shows $(basename ${0}) version.
+EOF
+)
+
+: ${VM_USER:=root}
+: ${VM_MEMORY:=2048}
+: ${VM_CPU:=1}
+: ${VM_TIMEOUT:=60}
+: ${VM_SHUT_DOWN:=false}
+: ${VM_VERSION:=false}
+: ${VM_ARCH:=$(arch)}
+: ${VM_CONF:=$(dirname $0)/$(basename $0).conf}
+
+${VM_VERSION} && { echo $(basename ${0}): version ${_VM_VERSION_}; exit 0; }
+
+[ -f "${VM_CONF}" ] && . "${VM_CONF}"
+
+for var in VM_TIMEOUT VM_IMAGE VM_MEMORY VM_CPU VM_USER VM_HOST_NAME VM_ARCH; do
+	: ${!var:? ${0}:${LINENO}: Undefined variable ${var}}
+done
+
+COMMAND=$@
+
+trap 'echo; exit 1' INT
+
+pgrep -f "qemu-system-.*${VM_IMAGE}" 2>&1 >/dev/null || {
+	for share in ${VM_SHARE}; do
+		VM_SHARE_OPT="${VM_SHARE_OPT} -virtfs local,path=${share/:*/},security_model=passthrough,mount_tag=$(echo ${share/*:/}|sed 's@/@@g')"
+	done
+	sudo qemu-system-${VM_ARCH} -machine accel=kvm:tcg -m ${VM_MEMORY} -smp cpus=${VM_CPU} -net nic -net tap -display none -daemonize ${VM_SHARE_OPT} ${VM_IMAGE} 2>&1 >/dev/null
+}
+VM_PID=$(pgrep -f ${VM_IMAGE})
+
+[ 0 -eq ${VM_TIMEOUT} ] && exit 0
+for i in $(seq 1 ${VM_TIMEOUT}); do
+	printf '\r\33[KTry to connect to %s (%d/%d)' ${VM_HOST_NAME} $i ${VM_TIMEOUT}
+   ping -c 1 -w 1 ${VM_HOST_NAME} 2>&1 >/dev/null && {
+		echo
+		if [ -n "${VM_SHARE}" ]; then
+			ssh root@${VM_HOST_NAME} "for share in ${VM_SHARE}; do mkdir --parent \${share/*:/}; mount -t 9p -o trans=virtio \$(echo \${share/*:/}|sed 's@/@@g') \${share/*:/} -o version=9p2000.L; done"
+		fi
+		if [ -z "${COMMAND}" ]; then
+			ssh ${VM_USER}@${VM_HOST_NAME}
+			${VM_SHUT_DOWN} && {
+				ping -c 1 -w 1 ${VM_HOST_NAME} 2>&1 >/dev/null && ssh root@${VM_HOST_NAME} halt
+			}
+		else
+			ssh ${VM_USER}@${VM_HOST_NAME} ${COMMAND} $(${VM_SHUT_DOWN} && echo '\; halt' || echo)
+		fi
+		${VM_SHUT_DOWN} && {
+			while [ -n "$(pgrep -ns ${VM_PID})" ]; do
+				sleep 1
+			done
+		}
+		exit 0
+	}
+done
+echo
+
+echo Unable to connect to VM ${VM_HOST_NAME} >&2
+exit 2
+
